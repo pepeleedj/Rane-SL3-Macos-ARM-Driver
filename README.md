@@ -6,9 +6,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pepeleedj/Rane-SL3-Mac-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip"><strong>⬇️ DOWNLOAD INSTALLER (.ZIP)</strong></a>
+  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip"><strong>⬇️ DOWNLOAD INSTALLER (.ZIP)</strong></a>
   &nbsp;|&nbsp;
-  <a href="https://github.com/pepeleedj/Rane-SL3-Mac-ARM-Driver/raw/main/Installer/RaneSL3-macOS-Universal.pkg"><strong>📦 DOWNLOAD .PKG DIRECTLY</strong></a>
+  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Installer/RaneSL3-macOS-Universal.pkg"><strong>📦 DOWNLOAD .PKG DIRECTLY</strong></a>
   &nbsp;|&nbsp;
   <a href="#-español-instrucciones-en-español"><strong>🇪🇸 LEER EN ESPAÑOL</strong></a>
 </p>
@@ -31,7 +31,7 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 
 ### 🚀 Quick Installation (1-Click)
 
-1. [**Download `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Mac-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) and unzip it on your Mac.
+1. [**Download `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) and unzip it on your Mac.
 2. Open Terminal and clear macOS Gatekeeper quarantine on the downloaded folder (type `xattr -cr ` with a space at the end, drag the unzipped folder into Terminal, and press **Enter**):
    ```bash
    xattr -cr ~/Downloads/Installer
@@ -47,9 +47,10 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 
 ---
 
-### 🧪 Wanted: Rane SL2 & Rane SL4 Beta Testers!
-Do you own a **Rane SL2** or **Rane SL4** and want native Apple Silicon (M1/M2/M3/M4) support without disabling SIP?
-* Open an [**Issue on GitHub**](https://github.com/pepeleedj/Rane-SL3-Mac-ARM-Driver/issues) or message [**@pepeleedj on Instagram**](https://www.instagram.com/pepeleedj/) so we can build and test the dedicated SL2 / SL4 bridges with your hardware!
+### 🔗 Also Available: Rane SL 2 & Rane SL 4 macOS ARM Drivers!
+Own a **Rane SL 2** or **Rane SL 4**? Download their dedicated Apple Silicon (M1 / M2 / M3 / M4) drivers here:
+* 🎛️ **Rane SL 2 Driver:** [pepeleedj/Rane-SL2-Macos-ARM-Driver](https://github.com/pepeleedj/Rane-SL2-Macos-ARM-Driver)
+* 🎛️ **Rane SL 4 Driver:** [pepeleedj/Rane-SL4-macOS-ARM-Driver](https://github.com/pepeleedj/Rane-SL4-macOS-ARM-Driver)
 
 ---
 ---
@@ -72,7 +73,7 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 
 Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requieren reiniciar el Mac**):
 
-1. [**Descarga `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Mac-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) y descomprímelo.
+1. [**Descarga `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) y descomprímelo.
 2. Si macOS bloquea los archivos descargados de Internet, abre la app **Terminal**, escribe `xattr -cr ` (con un espacio al final), arrastra la carpeta descomprimida dentro de la Terminal y pulsa **ENTER**:
    ```bash
    xattr -cr ~/Downloads/Installer
@@ -88,6 +89,13 @@ Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requ
 * **Canales 1–2:** Left Deck (Plato / CDJ Izquierdo)
 * **Canales 3–4:** Right Deck (Plato / CDJ Derecho)
 * **Canales 5–6:** Aux (Entrada / Salida Auxiliar)
+
+---
+
+### 🔗 También disponibles: Drivers para Rane SL 2 y Rane SL 4 (M1 / M2 / M3 / M4)
+* 🎛️ **Rane SL 2:** [pepeleedj/Rane-SL2-Macos-ARM-Driver](https://github.com/pepeleedj/Rane-SL2-Macos-ARM-Driver)
+* 🎛️ **Rane SL 3:** [pepeleedj/Rane-SL3-Macos-ARM-Driver](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver)
+* 🎛️ **Rane SL 4:** [pepeleedj/Rane-SL4-macOS-ARM-Driver](https://github.com/pepeleedj/Rane-SL4-macOS-ARM-Driver)
 
 ---
 
