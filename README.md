@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="pepelee_logo.png" alt="PPLEE Logo" width="180" />
-</p>
-
 <h1 align="center">Rane SL3 macOS ARM Driver (Apple Silicon M1 / M2 / M3 / M4)</h1>
 
 <p align="center">
