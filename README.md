@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Native User-Space CoreAudio Driver + Serato DJ Pro 2.5.5 Bridge (<code>Sl3Api.framework</code>) for Rane SL3 on Modern Macs</strong><br>
-  <em>Original idea & project by <strong>pepelee (PPLEE)</strong> — <a href="https://www.instagram.com/pepeleedj/">@pepeleedj</a></em>
+  <em>Original idea & project by <strong>pepelee (PPLEE)</strong> — <a href="https://www.instagram.com/pepeleedj/">@pepeleedj</a> &nbsp;|&nbsp; Ultra-low-latency audio engine & CoreAudio architecture with <strong>Ben XO</strong> (<a href="https://github.com/ben-xo">@ben-xo</a>)</em>
 </p>
 
 <p align="center">
@@ -26,6 +26,7 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 * ✅ **NO SIP Disable Required & NO Reboot Required:** Runs 100% in user space via Apple's modern `AudioServerPlugIn` (CoreAudio HAL) and `IOUSBHost` frameworks, plus a custom Universal `Sl3Api.framework` user-space bridge.
 * ✅ **Works with the macOS System Settings "SL 3" Control Panel** and includes a terminal control utility (`sl3panel`) to switch between **Phono / Line**, toggle **Thru**, and change sample rates (**44.1 kHz / 48 kHz**).
 * ✅ **Works as a 6-In / 6-Out (24-bit) CoreAudio Soundcard** in **Mixxx, Traktor, Ableton Live, Rekordbox, Logic Pro**, and system-wide macOS audio.
+* ✅ **Ultra-Low-Latency Audio Engine (~9–15 ms DVS Round-Trip):** Deep-scheduled isochronous USB playback with late writes directly from `WriteMix`, low-latency capture (`IN_SAFETY = 4 ms`, `OUT_SAFETY = 3 ms`), native macOS master + 6-channel volume/mute controls (`-64 dB` to `0 dB` with click-free ramping), and seamless USB hot-plug reconnect.
 
 ---
 
@@ -66,6 +67,7 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 * ✅ **SIN desactivar la seguridad del Mac (SIP) y SIN reiniciar:** Todo funciona en espacio de usuario mediante un plugin HAL de CoreAudio (`SL3Device.driver` sobre `IOUSBHost`) junto con un puente nativo Universal (`Sl3Api.framework`).
 * ✅ **Funciona con el panel "SL 3" en Ajustes del Sistema de macOS** e incluye utilidad de control (`Panel-Control-SL3.command` / `sl3panel`) para cambiar entre **Phono / Line**, activar/desactivar **Thru** y elegir entre **44.1 kHz y 48 kHz**.
 * ✅ **Funciona como tarjeta de sonido de 6 Entradas y 6 Salidas (24-bit)** en **Ableton Live, Traktor, Mixxx, Rekordbox, Logic Pro** y el audio general de macOS.
+* ✅ **Motor de Audio de Ultra-Baja Latencia (~9–15 ms DVS Round-Trip):** Escritura tardía (`late-write`) directa sobre transferencias USB isócronas desde `WriteMix`, captura de baja latencia, control nativo de volumen/mute en macOS (Master + 6 canales con rampa sin clics) y reconexión USB en caliente (`hot-plug`).
 
 ---
 
@@ -112,5 +114,6 @@ make device-plugin
 
 ### 🙌 Créditos y Licencia / Credits & License
 * **Idea original, puente Serato (`Sl3Api.framework`), utilidad `sl3panel` e instalador macOS Universal:** **pepelee (PPLEE)** — Instagram: [@pepeleedj](https://www.instagram.com/pepeleedj/)
+* **Arquitectura de baja latencia (`WriteMix` late-write, controles de volumen/mute CoreAudio, hot-plug):** **Ben XO** — GitHub: [@ben-xo](https://github.com/ben-xo)
 * **Base User-Space CoreAudio HAL Plugin (`OpenSL3`):** Basado en el proyecto open-source [OpenSL3](https://github.com/mrbrainz/OpenSL3) bajo licencia [GPL-3.0-or-later](LICENSE).
 * *Disclaimer:* Proyecto independiente no afiliado con Rane ni Serato. "Rane", "SL3" y "Serato" son marcas registradas de sus respectivos propietarios.

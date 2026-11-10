@@ -7,10 +7,12 @@
  * AudioObject properties ('sl3h' and 'sl3s').
  */
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #include <CoreAudio/CoreAudio.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define kSL3PropHIDRequest 'sl3h'
 #define kSL3PropStatus     'sl3s'
@@ -50,7 +52,18 @@ static dispatch_source_t g_cb_timer;
 static int g_have_prev_st;
 static sl3_hal_status_t g_prev_st;
 
-static AudioObjectID find_sl3_device(void) {
+static int sl3_on_usb(void) {
+    CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
+    if (!m) return 0;
+    NSDictionary *p = @{@"idVendor": @0x1cc5, @"idProduct": @0x0001};
+    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), (__bridge CFDictionaryRef)p);
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, m);
+    if (!s) return 0;
+    IOObjectRelease(s);
+    return 1;
+}
+
+static AudioObjectID find_sl3_device_once(void) {
     AudioObjectPropertyAddress pa = {
         kAudioHardwarePropertyTranslateUIDToDevice,
         kAudioObjectPropertyScopeGlobal,
@@ -90,6 +103,18 @@ static AudioObjectID find_sl3_device(void) {
             CFRelease(duid);
             if (match) return devs[i];
         }
+    }
+    return kAudioObjectUnknown;
+}
+
+static AudioObjectID find_sl3_device(void) {
+    AudioObjectID dev = find_sl3_device_once();
+    if (dev != kAudioObjectUnknown || !sl3_on_usb()) return dev;
+    /* Wait up to 2 seconds if the SL3 was just plugged in and the HAL is still opening it */
+    for (int i = 0; i < 40 && sl3_on_usb(); i++) {
+        usleep(50000);
+        dev = find_sl3_device_once();
+        if (dev != kAudioObjectUnknown) return dev;
     }
     return kAudioObjectUnknown;
 }

@@ -27,6 +27,14 @@
 #include <os/log.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "sl3_dsp.h"
+
+static sl3_dsp_shm_t g_dsp_local;
+static sl3_dsp_shm_t *g_dsp_shm = &g_dsp_local;
+static sl3_deck_dsp_t g_deck_dsp[3];
+static int16_t (*g_deck_pcm[2])[8] = {NULL, NULL};
+static _Atomic uint32_t g_deck_pcm_ready[2] = {0, 0};
+static float g_pair_env[3] = {0.0f, 0.0f, 0.0f};
 
 #define VID 0x1cc5
 #define PID 0x0001
@@ -50,33 +58,47 @@ static double g_rate_hz = 44100;
 #define CAP_PKTS 8      /* microframes per transfer: 1 ms, must be a multiple of 8 */
 #define CAP_NXF 64      /* 64 ms of capture queued */
 #define PLAY_PKTS 8
-/* Playback queue depth in ms. Completions are sometimes delivered 15-20 ms
- * late; a shorter queue then runs dry and a few ms of output are lost. */
+/* Deep-schedule playback queue depth in ms (64 transfers of 1 ms queued ahead;
+ * WriteMix writes late directly into the queued transfer buffers ~3 ms before playback). */
 #ifndef PLAY_NXF
-#define PLAY_NXF 20
+#define PLAY_NXF 64
 #endif
-#define RING 16384      /* frames, power of two */
-#define ZTS_PERIOD 2048 /* frames between zero timestamps */
-/* Safety offsets (frames at 44.1 kHz, scaled with the rate): input must lag
- * the hardware by the worst completion delay, output must lead it by the
- * playback queue plus margin. */
+#define RING 16384       /* frames, power of two */
+#define ZTS_PERIOD 16384 /* frames between zero timestamps (>= 10923 required by CoreAudio HAL) */
+/* Safety offsets (frames at 44.1 kHz, scaled with the rate):
+ * With early capture read + deep-scheduled late-write playback:
+ *   IN_SAFETY  = 176 frames (~4.0 ms)
+ *   OUT_SAFETY = 132 frames (~3.0 ms)
+ *   LAT_IN     = 23  frames (~0.5 ms)
+ *   LAT_OUT    = 66  frames (~1.5 ms) */
 #ifndef IN_SAFETY
-#define IN_SAFETY  800
+#define IN_SAFETY  176
 #endif
 #ifndef OUT_SAFETY
-#define OUT_SAFETY (PLAY_NXF * 44 + 80)
+#define OUT_SAFETY 132
 #endif
 #define AT_RATE(f) ((UInt32)llround((f) * RATE / 44100.0))
-/* Converter latency (frames) beyond the USB timeline. sl3loop measured a
- * steady 47-frame round trip (deck 3 out -> deck 2 in, line), split evenly. */
 #ifndef LAT_IN
 #define LAT_IN  23
 #endif
 #ifndef LAT_OUT
-#define LAT_OUT 24
+#define LAT_OUT 66
 #endif
 
-enum { kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjStreamIn = 3, kObjStreamOut = 4 };
+enum {
+    kObjPlugIn    = kAudioObjectPlugInObject,
+    kObjDevice    = 2,
+    kObjStreamIn  = 3,
+    kObjStreamOut = 4,
+    kObjVolume    = 5,   /* master output volume (element 0) */
+    kObjMute      = 6,   /* master output mute   (element 0) */
+    kObjVolCh1    = 7,   /* Aux Out L       (element 1) */
+    kObjVolCh2    = 8,   /* Aux Out R       (element 2) */
+    kObjVolCh3    = 9,   /* Left Deck Out L (element 3) */
+    kObjVolCh4    = 10,  /* Left Deck Out R (element 4) */
+    kObjVolCh5    = 11,  /* Right Deck Out L (element 5) */
+    kObjVolCh6    = 12,  /* Right Deck Out R (element 6) */
+};
 #define DEVICE_UID CFSTR("SL3Device_UID")
 #define MODEL_UID  CFSTR("SL3Device_Model")
 
@@ -113,12 +135,24 @@ static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb
 static struct { _Atomic uint32_t seq; double a_s, a_host, tpf; uint64_t seed; int valid; } g_clk;
 
 static void clk_read(double *a_s, double *a_host, double *tpf, uint64_t *seed, int *valid) {
-    uint32_t q;
-    do {
-        while ((q = atomic_load_explicit(&g_clk.seq, memory_order_acquire)) & 1) ;
-        *a_s = g_clk.a_s; *a_host = g_clk.a_host; *tpf = g_clk.tpf; *seed = g_clk.seed; *valid = g_clk.valid;
+    static __thread double last_s, last_h, last_tpf;
+    static __thread uint64_t last_seed;
+    static __thread int last_valid;
+    for (int tries = 0; tries < 64; tries++) {
+        uint32_t q = atomic_load_explicit(&g_clk.seq, memory_order_acquire);
+        if (q & 1) continue;
+        double s = g_clk.a_s, h = g_clk.a_host, t = g_clk.tpf;
+        uint64_t sd = g_clk.seed;
+        int v = g_clk.valid;
         atomic_thread_fence(memory_order_acquire);
-    } while (atomic_load_explicit(&g_clk.seq, memory_order_relaxed) != q);
+        if (atomic_load_explicit(&g_clk.seq, memory_order_relaxed) == q) {
+            *a_s = last_s = s; *a_host = last_h = h; *tpf = last_tpf = t;
+            *seed = last_seed = sd; *valid = last_valid = v;
+            return;
+        }
+    }
+    *a_s = last_s; *a_host = last_h; *tpf = last_tpf ? last_tpf : (1e9 / RATE / g_tick_ns);
+    *seed = last_seed; *valid = last_valid;
 }
 static void clk_write(double a_s, double a_host, double tpf, int new_seed) {
     atomic_fetch_add_explicit(&g_clk.seq, 1, memory_order_acq_rel);
@@ -166,6 +200,127 @@ static void clk_update(double s_end, double t_end) {
 /* ---- USB session ---- */
 #define kSL3PropHIDRequest 'sl3h'
 #define kSL3PropStatus     'sl3s'
+#define kSL3PropMeters     'sl3m'   /* CFDataRef (12 Float32: peak level of inputs 1-6, then outputs 1-6) */
+
+/* ---- Deep-schedule late-write ring (256 ms window indexed by USB frame) ---- */
+#define DP_RING 256
+#define DP_MASK (DP_RING - 1)
+typedef struct {
+    _Atomic uint64_t seq;
+    uint64_t frame;
+    uint64_t s0;
+    uint32_t total;
+    uint16_t pkt_n[PLAY_PKTS];
+    uint16_t pkt_off[PLAY_PKTS];
+    uint8_t *buf;
+} dp_slot_t;
+static dp_slot_t g_dp_sched[DP_RING];
+static _Atomic uint64_t g_dp_newest_s0;
+static _Atomic uint64_t g_dp_newest_frame;
+static _Atomic int g_dp_active;
+static _Atomic int g_dp_writers;
+
+static inline void pack_24le(uint8_t *q, const float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        float v = fr[c] > 1.0f ? 1.0f : fr[c] < -1.0f ? -1.0f : fr[c];
+        int32_t x = (int32_t)lrintf(v * 8388607.0f);
+        q[c * 3]     = (uint8_t)x;
+        q[c * 3 + 1] = (uint8_t)(x >> 8);
+        q[c * 3 + 2] = (uint8_t)(x >> 16);
+    }
+}
+
+/* Write a single processed 6-channel frame directly into its already-queued USB transfer buffer. */
+static void dp_write_frame(uint64_t s, const float *fr) {
+    uint64_t nf = atomic_load_explicit(&g_dp_newest_frame, memory_order_acquire);
+    uint64_t ns0 = atomic_load_explicit(&g_dp_newest_s0, memory_order_relaxed);
+    if (!nf) return;
+    int64_t ds = (int64_t)s - (int64_t)ns0;
+    int64_t df = ds / 44;
+    uint64_t start_f = (int64_t)nf + df - 4 > 0 ? (uint64_t)((int64_t)nf + df - 4) : 1;
+    for (int step = 0; step < 12; step++) {
+        uint64_t f = start_f + (uint64_t)step;
+        dp_slot_t *sl = &g_dp_sched[f & DP_MASK];
+        uint64_t q1 = atomic_load_explicit(&sl->seq, memory_order_acquire);
+        if ((q1 & 1) || sl->frame != f) continue;
+        uint64_t s0 = sl->s0;
+        uint32_t tot = sl->total;
+        uint8_t *buf = sl->buf;
+        if (s >= s0 && s < s0 + tot && buf) {
+            uint32_t rem = (uint32_t)(s - s0);
+            for (int k = 0; k < PLAY_PKTS; k++) {
+                uint16_t pn = sl->pkt_n[k];
+                if (rem < pn) {
+                    uint8_t *q = buf + sl->pkt_off[k] + rem * FRAME_BYTES;
+                    pack_24le(q, fr);
+                    break;
+                }
+                rem -= pn;
+            }
+            return;
+        }
+        if (s0 > s + 64) break;
+    }
+}
+
+/* ---- Output volume and mute (master + 6 channels, CoreAudio standard curve) ---- */
+#define VOL_MIN_DB  (-64.0f)
+#define VOL_MAX_DB  0.0f
+#define VOL_RAMP_MS 5.0f
+#define VOL_NCONTROLS (2 + NCH)
+static const AudioObjectID kControlObjs[VOL_NCONTROLS] = {
+    kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjVolCh5, kObjVolCh6, kObjMute
+};
+static _Atomic float g_vol_db[1 + NCH] = { 0, 0, 0, 0, 0, 0, 0 };
+static _Atomic bool  g_vol_mute = false;
+static _Atomic float g_vol_gain[NCH]    = { 1, 1, 1, 1, 1, 1 };
+static _Atomic float g_vol_applied[NCH] = { 1, 1, 1, 1, 1, 1 };
+static pthread_mutex_t g_vol_mtx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic float g_meter_peaks[2 * NCH];
+
+static int vol_index(AudioObjectID oid) {
+    for (int i = 0; i <= NCH; i++) if (kControlObjs[i] == oid) return i;
+    return -1;
+}
+static bool vol_is_control(AudioObjectID oid) { return oid == kObjMute || vol_index(oid) >= 0; }
+static float vol_scalar_to_db(float s) {
+    if (!isfinite(s) || s < 0) s = 0; else if (s > 1) s = 1;
+    return VOL_MIN_DB + sqrtf(s) * (VOL_MAX_DB - VOL_MIN_DB);
+}
+static float vol_db_to_scalar(float db) {
+    if (!isfinite(db) || db <= VOL_MIN_DB) return 0;
+    if (db >= VOL_MAX_DB) return 1;
+    float x = (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
+    return x * x;
+}
+static float vol_db_to_gain(float db) { return db <= VOL_MIN_DB ? 0.0f : powf(10.0f, db / 20.0f); }
+static void vol_update_gain(void) {
+    float master = atomic_load(&g_vol_mute) ? 0.0f : vol_db_to_gain(atomic_load(&g_vol_db[0]));
+    for (int ch = 0; ch < NCH; ch++)
+        atomic_store(&g_vol_gain[ch], master * vol_db_to_gain(atomic_load(&g_vol_db[1 + ch])));
+}
+static void vol_snap(void) {
+    for (int ch = 0; ch < NCH; ch++) atomic_store(&g_vol_applied[ch], atomic_load(&g_vol_gain[ch]));
+}
+static void vol_apply_frame(float *fr) {
+    float step = 1000.0f / (VOL_RAMP_MS * (float)RATE);
+    for (int ch = 0; ch < NCH; ch++) {
+        float target = atomic_load_explicit(&g_vol_gain[ch], memory_order_relaxed);
+        float g = atomic_load_explicit(&g_vol_applied[ch], memory_order_relaxed);
+        if (g != target) {
+            g = g < target ? fminf(g + step, target) : fmaxf(g - step, target);
+            atomic_store_explicit(&g_vol_applied[ch], g, memory_order_relaxed);
+        }
+        fr[ch] *= g;
+    }
+}
+static void meter_update(int base, const float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        float a = fabsf(fr[c]);
+        float prev = atomic_load_explicit(&g_meter_peaks[base + c], memory_order_relaxed);
+        if (a > prev) atomic_store_explicit(&g_meter_peaks[base + c], a, memory_order_relaxed);
+    }
+}
 
 typedef struct {
     uint32_t present;
@@ -297,6 +452,7 @@ static void cap_submit(int i) {
                         float a = fabsf(fr[c]);
                         if (a > g_pk_in[c]) g_pk_in[c] = a;
                     }
+                    meter_update(0, fr);
                     sring_put(&g_in, g_cap_s++, fr);
                 }
             }
@@ -320,27 +476,32 @@ static void play_submit(int i) {
         S.play_resyncs++;
         g_play_s = (uint64_t)llround(clk_sample_at(usb_frame_host(g_play, g_pframe)));
     }
+    uint64_t f_usb = g_pframe;
+    uint64_t s0 = g_play_s;
+    uint16_t pkt_n[PLAY_PKTS], pkt_off[PLAY_PKTS];
     int off = 0;
     for (int k = 0; k < PLAY_PKTS; k++) {
         int n;
         if (g_fifo_r != g_fifo_w) n = g_fifo[g_fifo_r++ % FIFO_N];
         else { g_acc += RATE * 125e-6; n = (int)g_acc; g_acc -= n; }
         if (n < 0 || n > PKT_MAX / FRAME_BYTES) n = 5;
+        pkt_n[k] = (uint16_t)n;
+        pkt_off[k] = (uint16_t)off;
         for (int f = 0; f < n; f++) {
             float fr[NCH];
-            if (!sring_get(&g_out, g_play_s, fr)) S.out_miss++;
-            for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_usb[c]) g_pk_usb[c] = a; }
-            g_play_s++;
-            uint8_t *q = p + off + f * FRAME_BYTES;
-            for (int c = 0; c < NCH; c++) {
-                float v = fr[c] > 1 ? 1 : fr[c] < -1 ? -1 : fr[c];
-                int32_t x = (int32_t)lrintf(v * 8388607.0f);
-                q[c * 3] = x; q[c * 3 + 1] = x >> 8; q[c * 3 + 2] = x >> 16;
+            if (sring_get(&g_out, g_play_s, fr)) {
+                sl3_dsp_au_pull(g_dsp_shm, g_play_s, fr);
+                for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_usb[c]) g_pk_usb[c] = a; }
+                pack_24le(p + off + f * FRAME_BYTES, fr);
+            } else {
+                memset(p + off + f * FRAME_BYTES, 0, FRAME_BYTES);
             }
+            g_play_s++;
         }
         tl[k] = (IOUSBHostIsochronousTransaction){ .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)off };
         off += n * FRAME_BYTES;
     }
+    uint32_t tot = (uint32_t)(g_play_s - s0);
     BOOL ok = usb_enqueue(g_ppipe, g_play, g_pbuf[i], tl, PLAY_PKTS, &g_pframe, ^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
         make_realtime();
         if (st == kIOReturnSuccess) { for (int k = 0; k < PLAY_PKTS; k++) if (done[k].status != kIOReturnSuccess) S.play_err++; }
@@ -349,7 +510,21 @@ static void play_submit(int i) {
         if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
         play_submit(i);
     });
-    if (!ok) { g_inflight--; g_stop = 1; }
+    if (ok) {
+        dp_slot_t *sl = &g_dp_sched[f_usb & DP_MASK];
+        atomic_fetch_add_explicit(&sl->seq, 1, memory_order_acq_rel);
+        sl->frame = f_usb;
+        sl->s0 = s0;
+        sl->total = tot;
+        memcpy(sl->pkt_n, pkt_n, sizeof(pkt_n));
+        memcpy(sl->pkt_off, pkt_off, sizeof(pkt_off));
+        sl->buf = p;
+        atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
+        atomic_store_explicit(&g_dp_newest_s0, s0, memory_order_relaxed);
+        atomic_store_explicit(&g_dp_newest_frame, f_usb, memory_order_release);
+    } else {
+        g_inflight--; g_stop = 1;
+    }
 }
 
 static void ensure_q(void) {
@@ -640,6 +815,10 @@ static int usb_open_all(void) {
 
     memset(&S, 0, sizeof S);
     memset(&g_rate, 0, sizeof g_rate);
+    memset(g_dp_sched, 0, sizeof g_dp_sched);
+    atomic_store(&g_dp_newest_s0, 0);
+    atomic_store(&g_dp_newest_frame, 0);
+    vol_snap();
     sring_clear(&g_in); sring_clear(&g_out);
     g_stop = 0; g_inflight = 0;
     g_fifo_w = g_fifo_r = 0; g_acc = 0;
@@ -651,7 +830,7 @@ static int usb_open_all(void) {
 
     /* capture first; once the clock model has an anchor, start playback */
     dispatch_sync(g_q, ^{
-        g_cframe = [g_cap frameNumberWithTime:NULL] + 5;
+        g_cframe = [g_cap frameNumberWithTime:NULL] + 8;
         for (int i = 0; i < CAP_NXF && !g_stop; i++) { g_inflight++; cap_submit(i); }
     });
     usleep(50000);
@@ -660,10 +839,11 @@ static int usb_open_all(void) {
     if (!started || g_stop) { os_log_error(g_log, "capture did not start"); usb_close(1); return -1; }
     dispatch_sync(g_q, ^{
         g_fifo_r = g_fifo_w;
-        g_pframe = [g_play frameNumberWithTime:NULL] + 2;
+        g_pframe = [g_play frameNumberWithTime:NULL] + 8;
         g_play_resync = 1;
         for (int i = 0; i < PLAY_NXF && !g_stop; i++) { g_inflight++; play_submit(i); }
     });
+    atomic_store(&g_dp_active, 1);
 
     /* interface 3: switch the decks to USB audio and keep the heartbeat going */
     if (g_hid) {
@@ -689,6 +869,8 @@ static int usb_open_all(void) {
 /* present: the box is still there, so reset alt settings and hand the decks back to thru. */
 static void usb_close(int present) {
     g_stop = 1;
+    atomic_store(&g_dp_active, 0);
+    while (atomic_load(&g_dp_writers) > 0) usleep(100);
     if (g_hb_timer) { dispatch_source_cancel(g_hb_timer); g_hb_timer = nil; }
     if (g_stat_timer) { dispatch_source_cancel(g_stat_timer); g_stat_timer = nil; }
     [g_cpipe abortWithError:nil];
@@ -767,6 +949,12 @@ static ULONG Release(void *d) { (void)d; return g_refs > 0 ? --g_refs : 0; }
 static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host) {
     (void)d;
     g_host = host;
+    sl3_dsp_init_defaults(&g_dsp_local);
+    sl3_dsp_shm_t *shm = sl3_dsp_open_shm();
+    g_dsp_shm = shm ? shm : &g_dsp_local;
+    sl3_deck_dsp_init(&g_deck_dsp[0]);
+    sl3_deck_dsp_init(&g_deck_dsp[1]);
+    sl3_deck_dsp_init(&g_deck_dsp[2]);
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     g_tick_ns = (double)tb.numer / tb.denom;
     CFPropertyListRef saved = NULL;
@@ -868,15 +1056,33 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioObjectPropertyCustomPropertyInfoList: {
             if (data) {
                 AudioServerPlugInCustomPropertyInfo *ci = (AudioServerPlugInCustomPropertyInfo *)data;
-                ci[0] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropHIDRequest, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList };
-                ci[1] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[0] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropHIDRequest,  kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList };
+                ci[1] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStatus,      kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[2] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropDSP,         kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[3] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStemProfile, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[4] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStemPCM,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[5] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropMeters,      kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
             }
-            return 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            return 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
         }
-        case kAudioObjectPropertyOwnedObjects: case kAudioDevicePropertyStreams: {
+        case kAudioObjectPropertyControlList:
+            if (data) memcpy(data, kControlObjs, sizeof(kControlObjs));
+            return sizeof(kControlObjs);
+        case kAudioDevicePropertyStreams: {
             int nin = sc != kAudioObjectPropertyScopeOutput, nout = sc != kAudioObjectPropertyScopeInput;
             if (data) { AudioObjectID *p = data; if (nin) *p++ = kObjStreamIn; if (nout) *p = kObjStreamOut; }
             return (UInt32)((nin + nout) * sizeof(AudioObjectID));
+        }
+        case kAudioObjectPropertyOwnedObjects: {
+            int nin = sc != kAudioObjectPropertyScopeOutput, nout = sc != kAudioObjectPropertyScopeInput;
+            int nctrl = (sc == kAudioObjectPropertyScopeGlobal || sc == kAudioObjectPropertyScopeOutput) ? VOL_NCONTROLS : 0;
+            if (data) {
+                AudioObjectID *p = data;
+                if (nin) *p++ = kObjStreamIn;
+                if (nout) *p++ = kObjStreamOut;
+                if (nctrl) memcpy(p, kControlObjs, sizeof(kControlObjs));
+            }
+            return (UInt32)((nin + nout + nctrl) * sizeof(AudioObjectID));
         }
         }
         return 0;
@@ -899,6 +1105,38 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
             return 2 * sizeof(AudioStreamRangedDescription);
         }
         return 0;
+    case kObjVolume: case kObjVolCh1: case kObjVolCh2: case kObjVolCh3:
+    case kObjVolCh4: case kObjVolCh5: case kObjVolCh6: case kObjMute: {
+        static CFStringRef const vnames[1 + NCH] = {
+            CFSTR("Output Volume"), CFSTR("Aux Out L"), CFSTR("Aux Out R"),
+            CFSTR("Left Deck Out L"), CFSTR("Left Deck Out R"),
+            CFSTR("Right Deck Out L"), CFSTR("Right Deck Out R")
+        };
+        int v = vol_index(o);
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass: RET(AudioClassID, v >= 0 ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
+        case kAudioObjectPropertyClass: RET(AudioClassID, v >= 0 ? kAudioVolumeControlClassID : kAudioMuteControlClassID);
+        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjDevice);
+        case kAudioObjectPropertyName: RET(CFStringRef, v >= 0 ? vnames[v] : CFSTR("Output Mute"));
+        case kAudioControlPropertyScope: RET(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput);
+        case kAudioControlPropertyElement: RET(AudioObjectPropertyElement, v > 0 ? (UInt32)v : kAudioObjectPropertyElementMain);
+        case kAudioLevelControlPropertyScalarValue: if (v >= 0) RET(Float32, vol_db_to_scalar(atomic_load(&g_vol_db[v]))); break;
+        case kAudioLevelControlPropertyDecibelValue: if (v >= 0) RET(Float32, atomic_load(&g_vol_db[v])); break;
+        case kAudioLevelControlPropertyDecibelRange:
+            if (v >= 0) { if (data) *(AudioValueRange *)data = (AudioValueRange){VOL_MIN_DB, VOL_MAX_DB}; return sizeof(AudioValueRange); }
+            break;
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+            if (v >= 0) { if (data) *(Float32 *)data = vol_scalar_to_db(*(Float32 *)data); return sizeof(Float32); }
+            break;
+        case kAudioLevelControlPropertyConvertDecibelsToScalar:
+            if (v >= 0) { if (data) *(Float32 *)data = vol_db_to_scalar(*(Float32 *)data); return sizeof(Float32); }
+            break;
+        case kAudioBooleanControlPropertyValue:
+            if (o == kObjMute) RET(UInt32, atomic_load(&g_vol_mute) ? 1 : 0);
+            break;
+        }
+        return 0;
+    }
     }
     return 0;
     #undef RET
@@ -906,25 +1144,29 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
 
 /* Properties that exist with an empty value. */
 static int prop_empty(AudioObjectID o, const AudioObjectPropertyAddress *a) {
-    return (o == kObjDevice && a->mSelector == kAudioObjectPropertyControlList) ||
-           (o == kObjPlugIn && a->mSelector == kAudioPlugInPropertyBoxList) ||
+    return (o == kObjPlugIn && a->mSelector == kAudioPlugInPropertyBoxList) ||
            (o == kObjPlugIn && !g_visible && (a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioPlugInPropertyDeviceList)) ||
-           ((o == kObjStreamIn || o == kObjStreamOut) && a->mSelector == kAudioObjectPropertyOwnedObjects);
+           ((o == kObjStreamIn || o == kObjStreamOut || vol_is_control(o)) && a->mSelector == kAudioObjectPropertyOwnedObjects);
 }
 
 /* kAudioObjectPropertyOwnedObjects, filtered by the qualifier's class IDs:
  * an object matches if its class or base class is listed. Returns the count. */
 static UInt32 owned(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, AudioObjectID *ids) {
-    AudioObjectID all[4];
+    AudioObjectID all[16];
     UInt32 n = prop(o, a, NULL, all) / sizeof(AudioObjectID), k = 0;
     for (UInt32 i = 0; i < n; i++) {
-        AudioClassID cls = all[i] == kObjDevice ? kAudioDeviceClassID : kAudioStreamClassID;
+        AudioObjectID id = all[i];
+        AudioClassID cls = id == kObjDevice ? kAudioDeviceClassID
+                         : (id == kObjStreamIn || id == kObjStreamOut) ? kAudioStreamClassID
+                         : id == kObjMute ? kAudioMuteControlClassID : kAudioVolumeControlClassID;
+        AudioClassID bcls = (id == kObjDevice || id == kObjStreamIn || id == kObjStreamOut) ? kAudioObjectClassID
+                          : id == kObjMute ? kAudioBooleanControlClassID : kAudioLevelControlClassID;
         int ok = !q || qs < sizeof(AudioClassID);
         for (UInt32 j = 0; !ok && j < qs / sizeof(AudioClassID); j++) {
             AudioClassID c = ((const AudioClassID *)q)[j];
-            ok = c == cls || c == kAudioObjectClassID;
+            ok = c == cls || c == bcls || c == kAudioControlClassID || c == kAudioObjectClassID;
         }
-        if (ok) ids[k++] = all[i];
+        if (ok) ids[k++] = id;
     }
     return k;
 }
@@ -935,25 +1177,54 @@ static int is_owned(AudioObjectID o, const AudioObjectPropertyAddress *a) {
 static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a) {
     (void)d; (void)pid;
     if (a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) return o == kObjPlugIn;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus)) return true;
+    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM || a->mSelector == kSL3PropMeters)) return true;
     return prop_empty(o, a) || prop(o, a, NULL, NULL) > 0;
 }
 static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, Boolean *s) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    *s = (o == kObjDevice && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kSL3PropStatus)) ||
+    int v = vol_index(o);
+    *s = (o == kObjDevice && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM)) ||
          ((o == kObjStreamIn || o == kObjStreamOut) &&
-          (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat));
+          (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) ||
+         (v >= 0 && (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) ||
+         (o == kObjMute && a->mSelector == kAudioBooleanControlPropertyValue);
     return noErr;
 }
 static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus)) { *sz = sizeof(CFPropertyListRef); return noErr; }
-    AudioObjectID ids[4];
+    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM || a->mSelector == kSL3PropMeters)) { *sz = sizeof(CFPropertyListRef); return noErr; }
+    AudioObjectID ids[16];
     *sz = prop_empty(o, a) ? 0 : is_owned(o, a) ? owned(o, a, qs, q, ids) * (UInt32)sizeof(AudioObjectID) : prop(o, a, q, NULL);
     return noErr;
 }
 static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 in, UInt32 *out, void *data) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    if (o == kObjDevice && a->mSelector == kSL3PropDSP) {
+        if (in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
+        sl3_dsp_ctrl_t ctrl;
+        memset(&ctrl, 0, sizeof(ctrl));
+        for (int i = 0; i < 2; i++) {
+            ctrl.vocal[i]          = atomic_load_explicit(&g_dsp_shm->vocal[i], memory_order_relaxed);
+            ctrl.melody[i]         = atomic_load_explicit(&g_dsp_shm->melody[i], memory_order_relaxed);
+            ctrl.bass[i]           = atomic_load_explicit(&g_dsp_shm->bass[i], memory_order_relaxed);
+            ctrl.drums[i]          = atomic_load_explicit(&g_dsp_shm->drums[i], memory_order_relaxed);
+            ctrl.echo_arm[i]       = atomic_load_explicit(&g_dsp_shm->echo_arm[i], memory_order_relaxed);
+            ctrl.vinyl_brake[i]    = atomic_load_explicit(&g_dsp_shm->vinyl_brake[i], memory_order_relaxed);
+            ctrl.filter[i]         = atomic_load_explicit(&g_dsp_shm->filter[i], memory_order_relaxed);
+            ctrl.echo_bpm[i]       = atomic_load_explicit(&g_dsp_shm->echo_bpm[i], memory_order_relaxed);
+            ctrl.meter_l[i]        = atomic_load_explicit(&g_dsp_shm->meter_l[i], memory_order_relaxed);
+            ctrl.meter_r[i]        = atomic_load_explicit(&g_dsp_shm->meter_r[i], memory_order_relaxed);
+            ctrl.ana_ready[i]      = atomic_load_explicit(&g_dsp_shm->ana_ready[i], memory_order_relaxed);
+            ctrl.ana_cur_frame[i]  = atomic_load_explicit(&g_dsp_shm->ana_cur_frame[i], memory_order_relaxed);
+            ctrl.ana_num_frames[i] = atomic_load_explicit(&g_dsp_shm->ana_num_frames[i], memory_order_relaxed);
+            for (int s = 0; s < 4; s++) {
+                ctrl.stem_meter[i][s] = atomic_load_explicit(&g_dsp_shm->stem_meter[i][s], memory_order_relaxed);
+            }
+        }
+        *(CFDataRef *)data = CFDataCreate(NULL, (const UInt8 *)&ctrl, sizeof(ctrl));
+        *out = sizeof(CFPropertyListRef);
+        return noErr;
+    }
     if (o == kObjDevice && a->mSelector == kSL3PropHIDRequest) {
         if (qs < sizeof(CFPropertyListRef) || !q || in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef qpl = *(const CFPropertyListRef *)q;
@@ -967,6 +1238,15 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
         uint8_t reply[HID_REPORT];
         if (hid_request(cmd, req + 2, len, reply) != 0) return kAudioHardwareNotRunningError;
         *(CFDataRef *)data = CFDataCreate(NULL, reply, HID_REPORT);
+        *out = sizeof(CFPropertyListRef);
+        return noErr;
+    }
+    if (o == kObjDevice && a->mSelector == kSL3PropMeters) {
+        if (in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
+        Float32 peaks[2 * NCH];
+        for (int i = 0; i < 2 * NCH; i++)
+            peaks[i] = atomic_exchange_explicit(&g_meter_peaks[i], 0.0f, memory_order_relaxed);
+        *(CFDataRef *)data = CFDataCreate(NULL, (const UInt8 *)peaks, sizeof(peaks));
         *out = sizeof(CFPropertyListRef);
         return noErr;
     }
@@ -985,7 +1265,7 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
     }
     if (prop_empty(o, a)) { *out = 0; return noErr; }
     if (is_owned(o, a)) {
-        AudioObjectID ids[4];
+        AudioObjectID ids[16];
         UInt32 n = owned(o, a, qs, q, ids);
         if (n > in / sizeof(AudioObjectID)) n = in / sizeof(AudioObjectID);
         memcpy(data, ids, n * sizeof(AudioObjectID));
@@ -995,10 +1275,10 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
     UInt32 need = prop(o, a, q, NULL);
     /* list properties may be asked for fewer items than they have */
     int list = a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioDevicePropertyStreams ||
-               a->mSelector == kAudioPlugInPropertyDeviceList;
+               a->mSelector == kAudioObjectPropertyControlList || a->mSelector == kAudioPlugInPropertyDeviceList;
     if (in < need) {
         if (!list) return kAudioHardwareBadPropertySizeError;
-        uint8_t tmp[64];
+        uint8_t tmp[128];
         prop(o, a, q, tmp);
         *out = in / sizeof(AudioObjectID) * sizeof(AudioObjectID);
         memcpy(data, tmp, *out);
@@ -1010,6 +1290,127 @@ static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
 static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz, const void *data) {
     (void)qs; (void)q; (void)sz; (void)data;
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
+    if (vol_is_control(o)) {
+        int v = vol_index(o);
+        if (v >= 0 && (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
+            if (!data || sz < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+            Float32 x = *(const Float32 *)data;
+            if (!isfinite(x)) return kAudioHardwareIllegalOperationError;
+            pthread_mutex_lock(&g_vol_mtx);
+            float db = (a->mSelector == kAudioLevelControlPropertyScalarValue) ? vol_scalar_to_db(x)
+                     : (x < VOL_MIN_DB ? VOL_MIN_DB : x > VOL_MAX_DB ? VOL_MAX_DB : x);
+            bool changed = db != atomic_load(&g_vol_db[v]);
+            atomic_store(&g_vol_db[v], db);
+            if (changed) vol_update_gain();
+            pthread_mutex_unlock(&g_vol_mtx);
+            if (changed && g_host) {
+                AudioObjectPropertyAddress va[2] = {
+                    { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+                    { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+                };
+                g_host->PropertiesChanged(g_host, o, 2, va);
+            }
+            return noErr;
+        }
+        if (o == kObjMute && a->mSelector == kAudioBooleanControlPropertyValue) {
+            if (!data || sz < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            bool m = *(const UInt32 *)data != 0;
+            pthread_mutex_lock(&g_vol_mtx);
+            bool changed = m != atomic_load(&g_vol_mute);
+            atomic_store(&g_vol_mute, m);
+            if (changed) vol_update_gain();
+            pthread_mutex_unlock(&g_vol_mtx);
+            if (changed && g_host) {
+                AudioObjectPropertyAddress ma = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+                g_host->PropertiesChanged(g_host, kObjMute, 1, &ma);
+            }
+            return noErr;
+        }
+        return kAudioHardwareUnsupportedOperationError;
+    }
+    if (o == kObjDevice && a->mSelector == kSL3PropStemPCM) {
+        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
+        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
+        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_pcm_chunk_hdr_t))
+            return kAudioHardwareBadPropertySizeError;
+        const uint8_t *raw = CFDataGetBytePtr((CFDataRef)pl);
+        sl3_pcm_chunk_hdr_t hdr;
+        memcpy(&hdr, raw, sizeof(hdr));
+        uint32_t dk = hdr.deck;
+        if (dk > 1 || hdr.start_sample >= SL3_PCM_MAX_SAMPLES || hdr.num_samples > SL3_PCM_MAX_SAMPLES - hdr.start_sample)
+            return kAudioHardwareBadPropertySizeError;
+        size_t payload_bytes = (size_t)hdr.num_samples * 16u;
+        if ((size_t)CFDataGetLength((CFDataRef)pl) < sizeof(sl3_pcm_chunk_hdr_t) + payload_bytes)
+            return kAudioHardwareBadPropertySizeError;
+        if (!g_deck_pcm[dk]) {
+            g_deck_pcm[dk] = (int16_t (*)[8])calloc(SL3_PCM_MAX_SAMPLES, 16u);
+            if (!g_deck_pcm[dk]) return kAudioHardwareUnspecifiedError;
+        }
+        if (hdr.start_sample == 0) {
+            atomic_store_explicit(&g_deck_pcm_ready[dk], 0, memory_order_release);
+            g_deck_dsp[dk].pcm_locked = 0;
+            g_deck_dsp[dk].pcm_pos = 0.0;
+        }
+        if (payload_bytes > 0) {
+            memcpy(&g_deck_pcm[dk][hdr.start_sample], raw + sizeof(sl3_pcm_chunk_hdr_t), payload_bytes);
+        }
+        uint32_t new_ready = hdr.start_sample + hdr.num_samples;
+        if (new_ready > atomic_load_explicit(&g_deck_pcm_ready[dk], memory_order_relaxed)) {
+            atomic_store_explicit(&g_deck_pcm_ready[dk], new_ready, memory_order_release);
+        }
+        os_log(g_log, "Loaded Time-Domain Stem PCM Chunk for Deck %u (%u..%u / %u samples)",
+               dk + 1, hdr.start_sample, new_ready, hdr.total_samples);
+        return noErr;
+    }
+    if (o == kObjDevice && a->mSelector == kSL3PropStemProfile) {
+        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
+        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
+        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_stem_profile_t))
+            return kAudioHardwareBadPropertySizeError;
+        const sl3_stem_profile_t *prof = (const sl3_stem_profile_t *)CFDataGetBytePtr((CFDataRef)pl);
+        uint32_t dk = prof->deck;
+        if (dk > 1) return kAudioHardwareBadPropertySizeError;
+        atomic_store_explicit(&g_dsp_shm->ana_ready[dk], 0, memory_order_release);
+        if (prof->is_neural == 0) {
+            atomic_store_explicit(&g_deck_pcm_ready[dk], 0, memory_order_release);
+            g_deck_dsp[dk].pcm_locked = 0;
+            g_deck_dsp[dk].pcm_pos = 0.0;
+        }
+        memcpy(&g_dsp_shm->profile[dk], prof, sizeof(sl3_stem_profile_t));
+        uint32_t nf = prof->num_frames;
+        if (nf > SL3_ANA_MAX_FRAMES) nf = SL3_ANA_MAX_FRAMES;
+        atomic_store_explicit(&g_dsp_shm->ana_num_frames[dk], nf, memory_order_relaxed);
+        uint32_t shm_cur = atomic_load_explicit(&g_dsp_shm->ana_cur_frame[dk], memory_order_relaxed);
+        if (shm_cur == 0 || prof->is_neural == 0 || (uint32_t)g_deck_dsp[dk].ana_cur_frame >= nf) {
+            g_deck_dsp[dk].ana_cur_frame = 0;
+            g_deck_dsp[dk].fp_valid_frames = 0;
+            g_deck_dsp[dk].ana_locked = 0;
+            g_deck_dsp[dk].ana_miss_streak = 0;
+            atomic_store_explicit(&g_dsp_shm->ana_cur_frame[dk], 0, memory_order_relaxed);
+        }
+        atomic_store_explicit(&g_dsp_shm->ana_ready[dk], (nf > 8) ? 1 : 0, memory_order_release);
+        os_log(g_log, "Loaded Neural Stem Profile for Deck %u (%u frames, neural=%u)", dk + 1, nf, prof->is_neural);
+        return noErr;
+    }
+    if (o == kObjDevice && a->mSelector == kSL3PropDSP) {
+        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
+        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
+        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_dsp_ctrl_t))
+            return kAudioHardwareBadPropertySizeError;
+        sl3_dsp_ctrl_t ctrl;
+        memcpy(&ctrl, CFDataGetBytePtr((CFDataRef)pl), sizeof(ctrl));
+        for (int i = 0; i < 2; i++) {
+            atomic_store_explicit(&g_dsp_shm->vocal[i],       ctrl.vocal[i],       memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->melody[i],      ctrl.melody[i],      memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->bass[i],        ctrl.bass[i],        memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->drums[i],       ctrl.drums[i],       memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->echo_arm[i],    ctrl.echo_arm[i],    memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->vinyl_brake[i], ctrl.vinyl_brake[i], memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->filter[i],      ctrl.filter[i],      memory_order_relaxed);
+            atomic_store_explicit(&g_dsp_shm->echo_bpm[i],    ctrl.echo_bpm[i],    memory_order_relaxed);
+        }
+        return noErr;
+    }
     if (o == kObjDevice && a->mSelector == kSL3PropStatus) {
         if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef pl = *(const CFPropertyListRef *)data;
@@ -1109,9 +1510,45 @@ static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectI
         uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
         if (g_out_next && t != g_out_next) S.out_jumps++;
         g_out_next = t + n;
+        if (g_dsp_shm == &g_dsp_local) {
+            sl3_dsp_shm_t *shm = sl3_dsp_open_shm();
+            if (shm) g_dsp_shm = shm;
+        }
+        float sr = (float)RATE;
         for (UInt32 f = 0; f < n; f++) {
-            sring_put(&g_out, t + f, buf + f * NCH);
-            for (int c = 0; c < NCH; c++) { float a = fabsf(buf[f * NCH + c]); if (a > g_pk_hal[c]) g_pk_hal[c] = a; }
+            float fr[NCH];
+            memcpy(fr, buf + f * NCH, sizeof(float) * NCH);
+            float p0 = fmaxf(fabsf(fr[0]), fabsf(fr[1]));
+            float p1 = fmaxf(fabsf(fr[2]), fabsf(fr[3]));
+            float p2 = fmaxf(fabsf(fr[4]), fabsf(fr[5]));
+            g_pair_env[0] = p0 > g_pair_env[0] ? p0 : g_pair_env[0] * 0.9995f;
+            g_pair_env[1] = p1 > g_pair_env[1] ? p1 : g_pair_env[1] * 0.9995f;
+            g_pair_env[2] = p2 > g_pair_env[2] ? p2 : g_pair_env[2] * 0.9995f;
+            /*
+             * Rane SL3 USB hardware & Serato DJ Pro 2.5.5 output channel layout:
+             *   fr[0..1] (Ch 1-2) = Aux Out (or Deck 1 in generic DAWs)
+             *   fr[2..3] (Ch 3-4) = Left Deck  (Deck 1 -> d = 0)
+             *   fr[4..5] (Ch 5-6) = Right Deck (Deck 2 -> d = 1)
+             */
+            uint32_t pcm_r0 = atomic_load_explicit(&g_deck_pcm_ready[0], memory_order_acquire);
+            uint32_t pcm_r1 = atomic_load_explicit(&g_deck_pcm_ready[1], memory_order_acquire);
+            sl3_dsp_process_deck(&g_deck_dsp[0], g_dsp_shm, 0, g_deck_pcm[0], pcm_r0, &fr[2], &fr[3], sr);
+            sl3_dsp_process_deck(&g_deck_dsp[1], g_dsp_shm, 1, g_deck_pcm[1], pcm_r1, &fr[4], &fr[5], sr);
+            if (g_pair_env[0] > 1e-4f && g_pair_env[1] < 1e-4f) {
+                g_deck_dsp[2].is_aux_instance = 1;
+                sl3_dsp_process_deck(&g_deck_dsp[2], g_dsp_shm, 0, NULL, 0, &fr[0], &fr[1], sr);
+            }
+            sl3_dsp_au_push(g_dsp_shm, t + f, fr);
+            vol_apply_frame(fr);
+            meter_update(NCH, fr);
+            sring_put(&g_out, t + f, fr);
+            if (atomic_load_explicit(&g_dp_active, memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_acquire);
+                if (atomic_load_explicit(&g_dp_active, memory_order_relaxed))
+                    dp_write_frame(t + f, fr);
+                atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
+            }
+            for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_hal[c]) g_pk_hal[c] = a; }
         }
     }
     return noErr;
