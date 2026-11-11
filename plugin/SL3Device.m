@@ -27,14 +27,6 @@
 #include <os/log.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include "sl3_dsp.h"
-
-static sl3_dsp_shm_t g_dsp_local;
-static sl3_dsp_shm_t *g_dsp_shm = &g_dsp_local;
-static sl3_deck_dsp_t g_deck_dsp[3];
-static int16_t (*g_deck_pcm[2])[8] = {NULL, NULL};
-static _Atomic uint32_t g_deck_pcm_ready[2] = {0, 0};
-static float g_pair_env[3] = {0.0f, 0.0f, 0.0f};
 
 #define VID 0x1cc5
 #define PID 0x0001
@@ -490,7 +482,6 @@ static void play_submit(int i) {
         for (int f = 0; f < n; f++) {
             float fr[NCH];
             if (sring_get(&g_out, g_play_s, fr)) {
-                sl3_dsp_au_pull(g_dsp_shm, g_play_s, fr);
                 for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_usb[c]) g_pk_usb[c] = a; }
                 pack_24le(p + off + f * FRAME_BYTES, fr);
             } else {
@@ -949,12 +940,6 @@ static ULONG Release(void *d) { (void)d; return g_refs > 0 ? --g_refs : 0; }
 static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host) {
     (void)d;
     g_host = host;
-    sl3_dsp_init_defaults(&g_dsp_local);
-    sl3_dsp_shm_t *shm = sl3_dsp_open_shm();
-    g_dsp_shm = shm ? shm : &g_dsp_local;
-    sl3_deck_dsp_init(&g_deck_dsp[0]);
-    sl3_deck_dsp_init(&g_deck_dsp[1]);
-    sl3_deck_dsp_init(&g_deck_dsp[2]);
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     g_tick_ns = (double)tb.numer / tb.denom;
     CFPropertyListRef saved = NULL;
@@ -1056,14 +1041,11 @@ static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const v
         case kAudioObjectPropertyCustomPropertyInfoList: {
             if (data) {
                 AudioServerPlugInCustomPropertyInfo *ci = (AudioServerPlugInCustomPropertyInfo *)data;
-                ci[0] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropHIDRequest,  kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList };
-                ci[1] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStatus,      kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
-                ci[2] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropDSP,         kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
-                ci[3] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStemProfile, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
-                ci[4] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStemPCM,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
-                ci[5] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropMeters,      kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[0] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropHIDRequest, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList };
+                ci[1] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+                ci[2] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
             }
-            return 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            return 3 * sizeof(AudioServerPlugInCustomPropertyInfo);
         }
         case kAudioObjectPropertyControlList:
             if (data) memcpy(data, kControlObjs, sizeof(kControlObjs));
@@ -1177,13 +1159,13 @@ static int is_owned(AudioObjectID o, const AudioObjectPropertyAddress *a) {
 static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a) {
     (void)d; (void)pid;
     if (a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) return o == kObjPlugIn;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM || a->mSelector == kSL3PropMeters)) return true;
+    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropMeters)) return true;
     return prop_empty(o, a) || prop(o, a, NULL, NULL) > 0;
 }
 static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, Boolean *s) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
     int v = vol_index(o);
-    *s = (o == kObjDevice && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM)) ||
+    *s = (o == kObjDevice && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kSL3PropStatus)) ||
          ((o == kObjStreamIn || o == kObjStreamOut) &&
           (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) ||
          (v >= 0 && (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) ||
@@ -1192,39 +1174,13 @@ static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t 
 }
 static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropDSP || a->mSelector == kSL3PropStemProfile || a->mSelector == kSL3PropStemPCM || a->mSelector == kSL3PropMeters)) { *sz = sizeof(CFPropertyListRef); return noErr; }
+    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropMeters)) { *sz = sizeof(CFPropertyListRef); return noErr; }
     AudioObjectID ids[16];
     *sz = prop_empty(o, a) ? 0 : is_owned(o, a) ? owned(o, a, qs, q, ids) * (UInt32)sizeof(AudioObjectID) : prop(o, a, q, NULL);
     return noErr;
 }
 static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 in, UInt32 *out, void *data) {
     if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && a->mSelector == kSL3PropDSP) {
-        if (in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
-        sl3_dsp_ctrl_t ctrl;
-        memset(&ctrl, 0, sizeof(ctrl));
-        for (int i = 0; i < 2; i++) {
-            ctrl.vocal[i]          = atomic_load_explicit(&g_dsp_shm->vocal[i], memory_order_relaxed);
-            ctrl.melody[i]         = atomic_load_explicit(&g_dsp_shm->melody[i], memory_order_relaxed);
-            ctrl.bass[i]           = atomic_load_explicit(&g_dsp_shm->bass[i], memory_order_relaxed);
-            ctrl.drums[i]          = atomic_load_explicit(&g_dsp_shm->drums[i], memory_order_relaxed);
-            ctrl.echo_arm[i]       = atomic_load_explicit(&g_dsp_shm->echo_arm[i], memory_order_relaxed);
-            ctrl.vinyl_brake[i]    = atomic_load_explicit(&g_dsp_shm->vinyl_brake[i], memory_order_relaxed);
-            ctrl.filter[i]         = atomic_load_explicit(&g_dsp_shm->filter[i], memory_order_relaxed);
-            ctrl.echo_bpm[i]       = atomic_load_explicit(&g_dsp_shm->echo_bpm[i], memory_order_relaxed);
-            ctrl.meter_l[i]        = atomic_load_explicit(&g_dsp_shm->meter_l[i], memory_order_relaxed);
-            ctrl.meter_r[i]        = atomic_load_explicit(&g_dsp_shm->meter_r[i], memory_order_relaxed);
-            ctrl.ana_ready[i]      = atomic_load_explicit(&g_dsp_shm->ana_ready[i], memory_order_relaxed);
-            ctrl.ana_cur_frame[i]  = atomic_load_explicit(&g_dsp_shm->ana_cur_frame[i], memory_order_relaxed);
-            ctrl.ana_num_frames[i] = atomic_load_explicit(&g_dsp_shm->ana_num_frames[i], memory_order_relaxed);
-            for (int s = 0; s < 4; s++) {
-                ctrl.stem_meter[i][s] = atomic_load_explicit(&g_dsp_shm->stem_meter[i][s], memory_order_relaxed);
-            }
-        }
-        *(CFDataRef *)data = CFDataCreate(NULL, (const UInt8 *)&ctrl, sizeof(ctrl));
-        *out = sizeof(CFPropertyListRef);
-        return noErr;
-    }
     if (o == kObjDevice && a->mSelector == kSL3PropHIDRequest) {
         if (qs < sizeof(CFPropertyListRef) || !q || in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef qpl = *(const CFPropertyListRef *)q;
@@ -1328,89 +1284,6 @@ static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid
         }
         return kAudioHardwareUnsupportedOperationError;
     }
-    if (o == kObjDevice && a->mSelector == kSL3PropStemPCM) {
-        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
-        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
-        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_pcm_chunk_hdr_t))
-            return kAudioHardwareBadPropertySizeError;
-        const uint8_t *raw = CFDataGetBytePtr((CFDataRef)pl);
-        sl3_pcm_chunk_hdr_t hdr;
-        memcpy(&hdr, raw, sizeof(hdr));
-        uint32_t dk = hdr.deck;
-        if (dk > 1 || hdr.start_sample >= SL3_PCM_MAX_SAMPLES || hdr.num_samples > SL3_PCM_MAX_SAMPLES - hdr.start_sample)
-            return kAudioHardwareBadPropertySizeError;
-        size_t payload_bytes = (size_t)hdr.num_samples * 16u;
-        if ((size_t)CFDataGetLength((CFDataRef)pl) < sizeof(sl3_pcm_chunk_hdr_t) + payload_bytes)
-            return kAudioHardwareBadPropertySizeError;
-        if (!g_deck_pcm[dk]) {
-            g_deck_pcm[dk] = (int16_t (*)[8])calloc(SL3_PCM_MAX_SAMPLES, 16u);
-            if (!g_deck_pcm[dk]) return kAudioHardwareUnspecifiedError;
-        }
-        if (hdr.start_sample == 0) {
-            atomic_store_explicit(&g_deck_pcm_ready[dk], 0, memory_order_release);
-            g_deck_dsp[dk].pcm_locked = 0;
-            g_deck_dsp[dk].pcm_pos = 0.0;
-        }
-        if (payload_bytes > 0) {
-            memcpy(&g_deck_pcm[dk][hdr.start_sample], raw + sizeof(sl3_pcm_chunk_hdr_t), payload_bytes);
-        }
-        uint32_t new_ready = hdr.start_sample + hdr.num_samples;
-        if (new_ready > atomic_load_explicit(&g_deck_pcm_ready[dk], memory_order_relaxed)) {
-            atomic_store_explicit(&g_deck_pcm_ready[dk], new_ready, memory_order_release);
-        }
-        os_log(g_log, "Loaded Time-Domain Stem PCM Chunk for Deck %u (%u..%u / %u samples)",
-               dk + 1, hdr.start_sample, new_ready, hdr.total_samples);
-        return noErr;
-    }
-    if (o == kObjDevice && a->mSelector == kSL3PropStemProfile) {
-        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
-        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
-        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_stem_profile_t))
-            return kAudioHardwareBadPropertySizeError;
-        const sl3_stem_profile_t *prof = (const sl3_stem_profile_t *)CFDataGetBytePtr((CFDataRef)pl);
-        uint32_t dk = prof->deck;
-        if (dk > 1) return kAudioHardwareBadPropertySizeError;
-        atomic_store_explicit(&g_dsp_shm->ana_ready[dk], 0, memory_order_release);
-        if (prof->is_neural == 0) {
-            atomic_store_explicit(&g_deck_pcm_ready[dk], 0, memory_order_release);
-            g_deck_dsp[dk].pcm_locked = 0;
-            g_deck_dsp[dk].pcm_pos = 0.0;
-        }
-        memcpy(&g_dsp_shm->profile[dk], prof, sizeof(sl3_stem_profile_t));
-        uint32_t nf = prof->num_frames;
-        if (nf > SL3_ANA_MAX_FRAMES) nf = SL3_ANA_MAX_FRAMES;
-        atomic_store_explicit(&g_dsp_shm->ana_num_frames[dk], nf, memory_order_relaxed);
-        uint32_t shm_cur = atomic_load_explicit(&g_dsp_shm->ana_cur_frame[dk], memory_order_relaxed);
-        if (shm_cur == 0 || prof->is_neural == 0 || (uint32_t)g_deck_dsp[dk].ana_cur_frame >= nf) {
-            g_deck_dsp[dk].ana_cur_frame = 0;
-            g_deck_dsp[dk].fp_valid_frames = 0;
-            g_deck_dsp[dk].ana_locked = 0;
-            g_deck_dsp[dk].ana_miss_streak = 0;
-            atomic_store_explicit(&g_dsp_shm->ana_cur_frame[dk], 0, memory_order_relaxed);
-        }
-        atomic_store_explicit(&g_dsp_shm->ana_ready[dk], (nf > 8) ? 1 : 0, memory_order_release);
-        os_log(g_log, "Loaded Neural Stem Profile for Deck %u (%u frames, neural=%u)", dk + 1, nf, prof->is_neural);
-        return noErr;
-    }
-    if (o == kObjDevice && a->mSelector == kSL3PropDSP) {
-        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
-        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
-        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(sl3_dsp_ctrl_t))
-            return kAudioHardwareBadPropertySizeError;
-        sl3_dsp_ctrl_t ctrl;
-        memcpy(&ctrl, CFDataGetBytePtr((CFDataRef)pl), sizeof(ctrl));
-        for (int i = 0; i < 2; i++) {
-            atomic_store_explicit(&g_dsp_shm->vocal[i],       ctrl.vocal[i],       memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->melody[i],      ctrl.melody[i],      memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->bass[i],        ctrl.bass[i],        memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->drums[i],       ctrl.drums[i],       memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->echo_arm[i],    ctrl.echo_arm[i],    memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->vinyl_brake[i], ctrl.vinyl_brake[i], memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->filter[i],      ctrl.filter[i],      memory_order_relaxed);
-            atomic_store_explicit(&g_dsp_shm->echo_bpm[i],    ctrl.echo_bpm[i],    memory_order_relaxed);
-        }
-        return noErr;
-    }
     if (o == kObjDevice && a->mSelector == kSL3PropStatus) {
         if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef pl = *(const CFPropertyListRef *)data;
@@ -1510,35 +1383,9 @@ static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectI
         uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
         if (g_out_next && t != g_out_next) S.out_jumps++;
         g_out_next = t + n;
-        if (g_dsp_shm == &g_dsp_local) {
-            sl3_dsp_shm_t *shm = sl3_dsp_open_shm();
-            if (shm) g_dsp_shm = shm;
-        }
-        float sr = (float)RATE;
         for (UInt32 f = 0; f < n; f++) {
             float fr[NCH];
             memcpy(fr, buf + f * NCH, sizeof(float) * NCH);
-            float p0 = fmaxf(fabsf(fr[0]), fabsf(fr[1]));
-            float p1 = fmaxf(fabsf(fr[2]), fabsf(fr[3]));
-            float p2 = fmaxf(fabsf(fr[4]), fabsf(fr[5]));
-            g_pair_env[0] = p0 > g_pair_env[0] ? p0 : g_pair_env[0] * 0.9995f;
-            g_pair_env[1] = p1 > g_pair_env[1] ? p1 : g_pair_env[1] * 0.9995f;
-            g_pair_env[2] = p2 > g_pair_env[2] ? p2 : g_pair_env[2] * 0.9995f;
-            /*
-             * Rane SL3 USB hardware & Serato DJ Pro 2.5.5 output channel layout:
-             *   fr[0..1] (Ch 1-2) = Aux Out (or Deck 1 in generic DAWs)
-             *   fr[2..3] (Ch 3-4) = Left Deck  (Deck 1 -> d = 0)
-             *   fr[4..5] (Ch 5-6) = Right Deck (Deck 2 -> d = 1)
-             */
-            uint32_t pcm_r0 = atomic_load_explicit(&g_deck_pcm_ready[0], memory_order_acquire);
-            uint32_t pcm_r1 = atomic_load_explicit(&g_deck_pcm_ready[1], memory_order_acquire);
-            sl3_dsp_process_deck(&g_deck_dsp[0], g_dsp_shm, 0, g_deck_pcm[0], pcm_r0, &fr[2], &fr[3], sr);
-            sl3_dsp_process_deck(&g_deck_dsp[1], g_dsp_shm, 1, g_deck_pcm[1], pcm_r1, &fr[4], &fr[5], sr);
-            if (g_pair_env[0] > 1e-4f && g_pair_env[1] < 1e-4f) {
-                g_deck_dsp[2].is_aux_instance = 1;
-                sl3_dsp_process_deck(&g_deck_dsp[2], g_dsp_shm, 0, NULL, 0, &fr[0], &fr[1], sr);
-            }
-            sl3_dsp_au_push(g_dsp_shm, t + f, fr);
             vol_apply_frame(fr);
             meter_update(NCH, fr);
             sring_put(&g_out, t + f, fr);
